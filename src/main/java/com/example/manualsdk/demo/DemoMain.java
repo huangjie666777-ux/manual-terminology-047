@@ -4,6 +4,7 @@ import com.example.manualsdk.index.DocumentOp;
 import com.example.manualsdk.index.ManualIndex;
 import com.example.manualsdk.model.ManualDocument;
 import com.example.manualsdk.model.SearchHit;
+import com.example.manualsdk.query.DeviceTermRule;
 import com.example.manualsdk.query.Field;
 import com.example.manualsdk.query.ManualQuery;
 import com.example.manualsdk.session.SearchPage;
@@ -51,6 +52,26 @@ public final class DemoMain {
             System.out.println("== New session sees the latest committed state ==");
             try (SearchSession fresh = index.openSession(query, 10)) {
                 print(fresh.nextPage());
+            }
+
+            System.out.println("== Device-term dictionary: old session is pinned, new sessions use the replacement ==");
+            ManualQuery abbreviation = ManualQuery.term(Field.BODY, "ecu");
+            index.applyBatch(List.of(
+                    DocumentOp.add(new ManualDocument("T-001", "Controller", "The ECU is under the cover.")),
+                    DocumentOp.add(new ManualDocument("T-002", "Location", "Find the electronic control unit behind the panel."))));
+            try (SearchSession before = index.openSession(abbreviation, 1)) {
+                System.out.println("before dictionary, page 1:");
+                print(before.nextPage());
+
+                index.replaceDeviceTerms(List.of(
+                        DeviceTermRule.of("ecu", "electronic control unit")));
+
+                System.out.println("after dictionary, old session page 2 stays on its snapshot:");
+                print(before.nextPage());
+            }
+            try (SearchSession after = index.openSession(abbreviation, 10)) {
+                System.out.println("new session after dictionary:");
+                print(after.nextPage());
             }
         }
 

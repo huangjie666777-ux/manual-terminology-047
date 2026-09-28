@@ -2,6 +2,8 @@ package com.example.manualsdk.index;
 
 import com.example.manualsdk.model.ManualDocument;
 import com.example.manualsdk.query.HitRangeExtractor;
+import com.example.manualsdk.query.DeviceTermDictionary;
+import com.example.manualsdk.query.DeviceTermRule;
 import com.example.manualsdk.query.ManualQuery;
 import com.example.manualsdk.query.QueryCompiler;
 import com.example.manualsdk.session.SearchSession;
@@ -23,7 +25,10 @@ import org.apache.lucene.util.BytesRef;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Path;
+import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -40,12 +45,13 @@ public final class ManualIndex implements AutoCloseable {
 
     private final Directory directory;
     private final Analyzer analyzer;
-    private final IndexWriter writer;
-    private final SearcherManager searcherManager;
+    private IndexWriter writer;
+    private SearcherManager searcherManager;
     private final QueryCompiler queryCompiler;
     private final HitRangeExtractor hitExtractor;
     private final Set<SearchSession> openSessions = ConcurrentHashMap.newKeySet();
     private final Object writeLock = new Object();
+    private volatile DeviceTermDictionary dictionary = DeviceTermDictionary.empty();
     private volatile boolean closed;
 
     private ManualIndex(Directory directory) throws IOException {
@@ -78,24 +84,42 @@ public final class ManualIndex implements AutoCloseable {
     public void applyBatch(List<DocumentOp> operations) {
         ensureOpen();
         validate(operations);
+        Map<String, PreparedOperation> prepared = prepare(operations);
         synchronized (writeLock) {
             ensureOpen();
             try {
-                for (DocumentOp op : operations) {
-                    if (op instanceof DocumentOp.Add add) {
-                        writer.addDocument(toLuceneDocument(add.document()));
-                    } else if (op instanceof DocumentOp.Replace replace) {
-                        writer.updateDocument(idTerm(replace.id()), toLuceneDocument(replace.document()));
-                    } else if (op instanceof DocumentOp.Delete delete) {
-                        writer.deleteDocuments(idTerm(delete.id()));
+                for (PreparedOperation operation : prepared.values()) {
+                    if (operation.document() == null) {
+                        writer.deleteDocuments(idTerm(operation.id()));
+                    } else {
+                        writer.updateDocument(idTerm(operation.id()), operation.document());
                     }
                 }
                 writer.commit();
                 searcherManager.maybeRefreshBlocking();
             } catch (IOException e) {
+                recoverAfterFailedBatch();
                 throw new UncheckedIOException(e);
             }
         }
+    }
+
+    /**
+     * Atomically replaces the in-memory dictionary. The input is fully
+     * validated and copied before publication; an invalid table leaves the
+     * previously published dictionary in use.
+     */
+    public void replaceDeviceTerms(Collection<DeviceTermRule> rules) {
+        ensureOpen();
+        DeviceTermDictionary compiled = DeviceTermDictionary.compile(analyzer, rules);
+        synchronized (writeLock) {
+            ensureOpen();
+            dictionary = compiled;
+        }
+    }
+
+    public DeviceTermDictionary deviceTerms() {
+        return dictionary;
     }
 
     public void addAll(List<ManualDocument> documents) {
@@ -122,6 +146,36 @@ public final class ManualIndex implements AutoCloseable {
         }
     }
 
+    private Map<String, PreparedOperation> prepare(List<DocumentOp> operations) {
+        Map<String, PreparedOperation> prepared = new LinkedHashMap<>();
+        for (DocumentOp op : operations) {
+            if (op instanceof DocumentOp.Add add) {
+                prepared.put(add.id(), new PreparedOperation(add.id(), toLuceneDocument(add.document())));
+            } else if (op instanceof DocumentOp.Replace replace) {
+                prepared.put(replace.id(), new PreparedOperation(replace.id(), toLuceneDocument(replace.document())));
+            } else if (op instanceof DocumentOp.Delete delete) {
+                prepared.put(delete.id(), new PreparedOperation(delete.id(), null));
+            }
+        }
+        return prepared;
+    }
+
+    private record PreparedOperation(String id, Document document) {
+    }
+
+    private void recoverAfterFailedBatch() {
+        try {
+            writer.rollback();
+            IndexWriterConfig config = new IndexWriterConfig(analyzer)
+                    .setOpenMode(IndexWriterConfig.OpenMode.CREATE_OR_APPEND);
+            writer = new IndexWriter(directory, config);
+            searcherManager.close();
+            searcherManager = new SearcherManager(writer, null);
+        } catch (IOException recoveryError) {
+            throw new UncheckedIOException(recoveryError);
+        }
+    }
+
     /**
      * Opens a search session pinned to the current index snapshot. Updates
      * committed after this call are invisible to the session; new sessions
@@ -130,9 +184,7 @@ public final class ManualIndex implements AutoCloseable {
     public SearchSession openSession(ManualQuery query, int pageSize) {
         ensureOpen();
         try {
-            SearchSession session = new SearchSession(this, query, pageSize);
-            openSessions.add(session);
-            return session;
+            return new SearchSession(this, query, pageSize);
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
@@ -142,8 +194,16 @@ public final class ManualIndex implements AutoCloseable {
         openSessions.remove(session);
     }
 
+    public void registerSession(SearchSession session) {
+        openSessions.add(session);
+    }
+
     public SearcherManager searcherManager() {
         return searcherManager;
+    }
+
+    public Object sessionLock() {
+        return writeLock;
     }
 
     public QueryCompiler queryCompiler() {

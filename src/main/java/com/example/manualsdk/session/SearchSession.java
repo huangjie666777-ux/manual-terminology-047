@@ -4,10 +4,12 @@ import com.example.manualsdk.index.ManualIndex;
 import com.example.manualsdk.model.HitRange;
 import com.example.manualsdk.model.SearchHit;
 import com.example.manualsdk.query.ManualQuery;
+import com.example.manualsdk.query.QueryException;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.ScoreDoc;
+import org.apache.lucene.search.SearcherManager;
 import org.apache.lucene.search.Sort;
 import org.apache.lucene.search.SortField;
 import org.apache.lucene.search.TopFieldDocs;
@@ -31,8 +33,11 @@ public final class SearchSession implements AutoCloseable {
 
     private final ManualIndex index;
     private final ManualQuery query;
+    private final ManualQuery effectiveQuery;
     private final int pageSize;
     private final IndexSearcher searcher;
+    private final SearcherManager searcherManager;
+    private final Query luceneQuery;
 
     private ScoreDoc after;
     private int pageNumber;
@@ -46,7 +51,21 @@ public final class SearchSession implements AutoCloseable {
         this.index = index;
         this.query = query;
         this.pageSize = pageSize;
-        this.searcher = index.searcherManager().acquire();
+        if (query == null) {
+            throw new QueryException("query must not be null");
+        }
+        IndexSearcher acquired;
+        synchronized (index.sessionLock()) {
+            if (index.isClosed()) {
+                throw new IllegalStateException("index is closed");
+            }
+            this.searcherManager = index.searcherManager();
+            this.effectiveQuery = index.deviceTerms().expand(query, index.queryCompiler());
+            this.luceneQuery = index.queryCompiler().compile(effectiveQuery);
+            acquired = searcherManager.acquire();
+            index.registerSession(this);
+        }
+        this.searcher = acquired;
     }
 
     /** Reads the next page from the fixed snapshot. */
@@ -56,7 +75,6 @@ public final class SearchSession implements AutoCloseable {
             return new SearchPage(List.of(), pageNumber, false);
         }
         try {
-            Query luceneQuery = index.queryCompiler().compile(query);
             TopFieldDocs top = searcher.searchAfter(after, luceneQuery, pageSize, SORT, true);
             List<SearchHit> hits = new ArrayList<>(top.scoreDocs.length);
             for (ScoreDoc scoreDoc : top.scoreDocs) {
@@ -77,7 +95,7 @@ public final class SearchSession implements AutoCloseable {
         String id = doc.get("id");
         String title = doc.get("title");
         String body = doc.get("body");
-        List<HitRange> ranges = index.hitExtractor().extract(query, title, body);
+        List<HitRange> ranges = index.hitExtractor().extract(effectiveQuery, title, body);
         return new SearchHit(id, scoreDoc.score, title, body, ranges);
     }
 
@@ -102,7 +120,7 @@ public final class SearchSession implements AutoCloseable {
         }
         index.releaseSession(this);
         try {
-            index.searcherManager().release(searcher);
+            searcherManager.release(searcher);
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }

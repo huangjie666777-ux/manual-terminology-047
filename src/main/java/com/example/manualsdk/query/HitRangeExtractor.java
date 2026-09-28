@@ -38,21 +38,51 @@ public final class HitRangeExtractor {
         return List.copyOf(ranges);
     }
 
-    private void collect(ManualQuery query, String title, String body, TreeSet<HitRange> out) {
+    private boolean collect(ManualQuery query, String title, String body, TreeSet<HitRange> out) {
         if (query instanceof ManualQuery.And and) {
-            and.children().forEach(child -> collect(child, title, body, out));
-        } else if (query instanceof ManualQuery.Or or) {
-            or.children().forEach(child -> collect(child, title, body, out));
-        } else if (query instanceof ManualQuery.Term term) {
+            TreeSet<HitRange> local = new TreeSet<>();
+            for (ManualQuery child : and.children()) {
+                if (!collect(child, title, body, local)) {
+                    return false;
+                }
+            }
+            out.addAll(local);
+            return true;
+        }
+        if (query instanceof ManualQuery.Or or) {
+            TreeSet<HitRange> local = new TreeSet<>();
+            boolean matched = false;
+            for (ManualQuery child : or.children()) {
+                if (collect(child, title, body, local)) {
+                    matched = true;
+                }
+            }
+            if (matched) {
+                out.addAll(local);
+            }
+            return matched;
+        }
+        TreeSet<HitRange> local = new TreeSet<>();
+        boolean matched;
+        if (query instanceof ManualQuery.Term term) {
             forEachField(term.field(), title, body,
-                    (field, tokens) -> markTerm(tokens, field, compiler.analyze(field, term.text()), out));
+                    (field, tokens) -> markTerm(tokens, field, compiler.analyze(field, term.text()), local));
+            matched = !local.isEmpty();
         } else if (query instanceof ManualQuery.Prefix prefix) {
             forEachField(prefix.field(), title, body,
-                    (field, tokens) -> markPrefix(tokens, field, compiler.analyze(field, prefix.prefix()), out));
+                    (field, tokens) -> markPrefix(tokens, field, compiler.analyze(field, prefix.prefix()), local));
+            matched = !local.isEmpty();
         } else if (query instanceof ManualQuery.Phrase phrase) {
             forEachField(phrase.field(), title, body,
-                    (field, tokens) -> markPhrase(tokens, field, compiler.analyze(field, phrase.text()), out));
+                    (field, tokens) -> markPhrase(tokens, field, compiler.analyze(field, phrase.text()), local));
+            matched = !local.isEmpty();
+        } else {
+            throw new QueryException("unsupported query node: " + query);
         }
+        if (matched) {
+            out.addAll(local);
+        }
+        return matched;
     }
 
     private interface FieldConsumer {

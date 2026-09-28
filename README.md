@@ -7,7 +7,7 @@
 
 - `com.example.manualsdk.model` — ManualDocument、SearchHit、HitRange 数据模型
 - `com.example.manualsdk.index` — ManualIndex（索引生命周期、原子批量写入）、DocumentOp
-- `com.example.manualsdk.query` — ManualQuery 查询树、QueryCompiler、HitRangeExtractor
+- `com.example.manualsdk.query` — ManualQuery 查询树、QueryCompiler、HitRangeExtractor、DeviceTermDictionary
 - `com.example.manualsdk.session` — SearchSession（固定快照分页）、SearchPage
 - `com.example.manualsdk.demo` — DemoMain 端到端示例
 
@@ -35,6 +35,26 @@ session.close();
 index.close();
 ```
 
+### 设备术语词典
+
+词典是有方向的内存映射：查询中的一个归一化英文词或词组可以匹配原文及多个替代词组；
+不会自动反向扩展，也不会对替代结果再次递归扩展。词项和短语查询会使用词典，前缀查询不扩展。
+短语按从左到右的最长规则匹配，多个替代词组成可选路径；多处替换可组合，但每条路径都必须按词序连续命中。
+
+```java
+index.replaceDeviceTerms(List.of(
+        new DeviceTermRule("ecu", List.of("electronic control unit", "engine control module")),
+        DeviceTermRule.of("brake pad", "friction material")));
+
+ManualQuery query = ManualQuery.phrase(Field.BODY, "ecu brake pad");
+index.replaceDeviceTerms(List.of()); // 发布空表即停用扩展，词典不落盘
+```
+
+`replaceDeviceTerms` 是整表替换：先使用索引的 StandardAnalyzer 完成归一化和校验，拒绝 null、空白、
+空替代列表以及分析后为空的 source/alternative；重复 source 和重复 alternative 会合并。校验或分析失败时
+保留旧词典。成功后发布不可变副本，调用方后续修改入参集合不会影响已发布内容。更新词典不需要重建索引，
+可与检索并行；重开索引时词典为空。
+
 ### 查询规则
 
 - 索引与查询均使用 StandardAnalyzer，保留停用词，分析行为一致。
@@ -52,9 +72,9 @@ HitRange(field, start, end) 为原字段文本的 UTF-16 左闭右开偏移，�
 
 - ManualIndex 实现 AutoCloseable；close() 会收回所有未关闭会话并释放
   writer / searcher / 目录资源。已提交批次在关闭重开后仍然保留。
-- SearchSession 固定创建时的索引快照：翻页期间的新增、替换、删除不会导致
-  结果重复、遗漏或正文漂移；新会话可见最新提交。会话用毕必须 close()，
-  关闭后继续使用抛出 IllegalStateException。
+- SearchSession 固定创建时的索引快照和已发布词典：查询在创建时完成词典扩展与 Lucene 编译，
+  翻页期间的新增、替换、删除和词典替换不会导致结果重复、遗漏、正文漂移或高亮规则漂移；
+  新会话采用创建时的最新提交和词典。会话用毕必须 close()，关闭后继续使用抛出 IllegalStateException。
 - 写入与查询可在单进程内并行；applyBatch 串行提交，读者始终看到最近一次提交。
 
 ## 构建、测试与运行
