@@ -8,6 +8,7 @@ import com.example.manualsdk.query.Field;
 import com.example.manualsdk.query.ManualQuery;
 import com.example.manualsdk.session.SearchPage;
 import com.example.manualsdk.session.SearchSession;
+import com.example.manualsdk.terminology.TerminologyRule;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -23,7 +24,7 @@ public final class DemoMain {
         Path dir = Files.createTempDirectory("manual-sdk-demo");
         ManualQuery query = ManualQuery.or(
                 ManualQuery.term(Field.TITLE, "engine"),
-                ManualQuery.phrase(Field.BODY, "oil filter"),
+                ManualQuery.phrase(Field.BODY, "ecu maintenance"),
                 ManualQuery.prefix(Field.ALL, "trans"));
 
         try (ManualIndex index = ManualIndex.open(dir)) {
@@ -32,7 +33,8 @@ public final class DemoMain {
                     DocumentOp.add(new ManualDocument("M-002", "Transmission service", "The transmission fluid must be checked.")),
                     DocumentOp.add(new ManualDocument("M-003", "Engine cooling", "Inspect the engine coolant level weekly.")),
                     DocumentOp.add(new ManualDocument("M-004", "Brake system", "Brake pads and oil filter are unrelated parts.")),
-                    DocumentOp.add(new ManualDocument("M-005", "Electrical", "Check the battery terminals."))));
+                    DocumentOp.add(new ManualDocument("M-005", "Electrical", "Check the battery terminals.")),
+                    DocumentOp.add(new ManualDocument("M-006", "Engine tuning", "Engine control unit maintenance is scheduled annually."))));
 
             System.out.println("== Paged session over a fixed snapshot (pageSize=2) ==");
             SearchSession session = index.openSession(query, 2);
@@ -42,7 +44,7 @@ public final class DemoMain {
             index.applyBatch(List.of(
                     DocumentOp.replace(new ManualDocument("M-002", "Transmission overhaul", "Full transmission rebuild guide.")),
                     DocumentOp.delete("M-004"),
-                    DocumentOp.add(new ManualDocument("M-006", "Engine tuning", "Advanced engine tuning and oil filter notes."))));
+                    DocumentOp.add(new ManualDocument("M-007", "Advanced ECU", "Advanced ecu maintenance notes."))));
 
             print(session.nextPage());
             print(session.nextPage());
@@ -51,6 +53,16 @@ public final class DemoMain {
             System.out.println("== New session sees the latest committed state ==");
             try (SearchSession fresh = index.openSession(query, 10)) {
                 print(fresh.nextPage());
+            }
+
+            System.out.println("== Terminology dictionary changes affect only new sessions ==");
+            ManualQuery terminologyQuery = ManualQuery.phrase(Field.BODY, "ecu maintenance");
+            try (SearchSession before = index.openSession(terminologyQuery, 10)) {
+                print(before.nextPage());
+            }
+            index.replaceTerminology(List.of(TerminologyRule.of("ecu", "engine control unit")));
+            try (SearchSession after = index.openSession(terminologyQuery, 10)) {
+                print(after.nextPage());
             }
         }
 

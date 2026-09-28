@@ -5,6 +5,8 @@ import com.example.manualsdk.query.HitRangeExtractor;
 import com.example.manualsdk.query.ManualQuery;
 import com.example.manualsdk.query.QueryCompiler;
 import com.example.manualsdk.session.SearchSession;
+import com.example.manualsdk.terminology.TerminologyDictionary;
+import com.example.manualsdk.terminology.TerminologyRule;
 import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.analysis.standard.StandardAnalyzer;
 import org.apache.lucene.document.Document;
@@ -40,10 +42,11 @@ public final class ManualIndex implements AutoCloseable {
 
     private final Directory directory;
     private final Analyzer analyzer;
-    private final IndexWriter writer;
+    private IndexWriter writer;
     private final SearcherManager searcherManager;
     private final QueryCompiler queryCompiler;
     private final HitRangeExtractor hitExtractor;
+    private volatile TerminologyDictionary terminology = TerminologyDictionary.empty();
     private final Set<SearchSession> openSessions = ConcurrentHashMap.newKeySet();
     private final Object writeLock = new Object();
     private volatile boolean closed;
@@ -51,11 +54,10 @@ public final class ManualIndex implements AutoCloseable {
     private ManualIndex(Directory directory) throws IOException {
         this.directory = directory;
         this.analyzer = new StandardAnalyzer();
-        IndexWriterConfig config = new IndexWriterConfig(analyzer)
-                .setOpenMode(IndexWriterConfig.OpenMode.CREATE_OR_APPEND);
-        this.writer = new IndexWriter(directory, config);
+        this.writer = createWriter();
         writer.commit();
-        this.searcherManager = new SearcherManager(writer, null);
+        this.searcherManager = new SearcherManager(directory, null);
+        searcherManager.maybeRefreshBlocking();
         this.queryCompiler = new QueryCompiler(analyzer);
         this.hitExtractor = new HitRangeExtractor(analyzer);
     }
@@ -64,6 +66,14 @@ public final class ManualIndex implements AutoCloseable {
     public static ManualIndex open(Path dir) {
         try {
             return new ManualIndex(NIOFSDirectory.open(dir));
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    static ManualIndex open(Directory directory) {
+        try {
+            return new ManualIndex(directory);
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
@@ -83,7 +93,7 @@ public final class ManualIndex implements AutoCloseable {
             try {
                 for (DocumentOp op : operations) {
                     if (op instanceof DocumentOp.Add add) {
-                        writer.addDocument(toLuceneDocument(add.document()));
+                        writer.updateDocument(idTerm(add.id()), toLuceneDocument(add.document()));
                     } else if (op instanceof DocumentOp.Replace replace) {
                         writer.updateDocument(idTerm(replace.id()), toLuceneDocument(replace.document()));
                     } else if (op instanceof DocumentOp.Delete delete) {
@@ -93,6 +103,21 @@ public final class ManualIndex implements AutoCloseable {
                 writer.commit();
                 searcherManager.maybeRefreshBlocking();
             } catch (IOException e) {
+                try {
+                    writer.rollback();
+                } catch (IOException rollbackError) {
+                    e.addSuppressed(rollbackError);
+                }
+                try {
+                    writer = createWriter();
+                } catch (IOException recreateError) {
+                    e.addSuppressed(recreateError);
+                }
+                try {
+                    searcherManager.maybeRefreshBlocking();
+                } catch (IOException refreshError) {
+                    e.addSuppressed(refreshError);
+                }
                 throw new UncheckedIOException(e);
             }
         }
@@ -110,6 +135,22 @@ public final class ManualIndex implements AutoCloseable {
         applyBatch(ids.stream().<DocumentOp>map(DocumentOp.Delete::new).toList());
     }
 
+    /** Atomically replaces the in-memory dictionary; validation failure keeps the old one. */
+    public void replaceTerminology(List<TerminologyRule> rules) {
+        ensureOpen();
+        terminology = TerminologyDictionary.publish(rules, analyzer);
+    }
+
+    /** Disables terminology expansion without rebuilding or touching the index. */
+    public void clearTerminology() {
+        ensureOpen();
+        terminology = TerminologyDictionary.empty();
+    }
+
+    public TerminologyDictionary terminology() {
+        return terminology;
+    }
+
     private void validate(List<DocumentOp> operations) {
         if (operations == null || operations.isEmpty()) {
             throw new IllegalArgumentException("batch must contain at least one operation");
@@ -120,6 +161,12 @@ public final class ManualIndex implements AutoCloseable {
             }
             // Record constructors already enforce non-blank ids and non-null documents.
         }
+    }
+
+    private IndexWriter createWriter() throws IOException {
+        IndexWriterConfig config = new IndexWriterConfig(analyzer)
+                .setOpenMode(IndexWriterConfig.OpenMode.CREATE_OR_APPEND);
+        return new IndexWriter(directory, config);
     }
 
     /**

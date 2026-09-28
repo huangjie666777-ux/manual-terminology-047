@@ -1,6 +1,7 @@
 package com.example.manualsdk.query;
 
 import com.example.manualsdk.model.HitRange;
+import com.example.manualsdk.terminology.TerminologyDictionary;
 import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.analysis.TokenStream;
 import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
@@ -33,26 +34,63 @@ public final class HitRangeExtractor {
 
     /** Returns deduplicated, position-sorted hit ranges for one document. */
     public List<HitRange> extract(ManualQuery query, String title, String body) {
+        return extract(query, TerminologyDictionary.empty(), title, body);
+    }
+
+    /** Returns ranges using the same terminology snapshot as retrieval. */
+    public List<HitRange> extract(ManualQuery query, TerminologyDictionary terminology,
+                                  String title, String body) {
         TreeSet<HitRange> ranges = new TreeSet<>();
-        collect(query, title, body, ranges);
+        TerminologyDictionary dictionary = terminology == null ? TerminologyDictionary.empty() : terminology;
+        collect(query, dictionary, title, body, ranges);
         return List.copyOf(ranges);
     }
 
-    private void collect(ManualQuery query, String title, String body, TreeSet<HitRange> out) {
+    private boolean collect(ManualQuery query, TerminologyDictionary dictionary,
+                            String title, String body, TreeSet<HitRange> out) {
         if (query instanceof ManualQuery.And and) {
-            and.children().forEach(child -> collect(child, title, body, out));
+            boolean allMatch = true;
+            for (ManualQuery child : and.children()) {
+                allMatch = collect(child, dictionary, title, body, out) && allMatch;
+            }
+            return allMatch;
         } else if (query instanceof ManualQuery.Or or) {
-            or.children().forEach(child -> collect(child, title, body, out));
+            boolean anyMatch = false;
+            for (ManualQuery child : or.children()) {
+                TreeSet<HitRange> childRanges = new TreeSet<>();
+                if (collect(child, dictionary, title, body, childRanges)) {
+                    anyMatch = true;
+                    out.addAll(childRanges);
+                }
+            }
+            return anyMatch;
         } else if (query instanceof ManualQuery.Term term) {
-            forEachField(term.field(), title, body,
-                    (field, tokens) -> markTerm(tokens, field, compiler.analyze(field, term.text()), out));
+            return collectLeaf(term.field(), title, body, out,
+                    (fields, fieldRanges) -> markPaths(fields,
+                            compiler.expandedTermPaths(term.text(), dictionary), fieldRanges));
         } else if (query instanceof ManualQuery.Prefix prefix) {
-            forEachField(prefix.field(), title, body,
-                    (field, tokens) -> markPrefix(tokens, field, compiler.analyze(field, prefix.prefix()), out));
+            return collectLeaf(prefix.field(), title, body, out,
+                    (fields, fieldRanges) -> markPrefix(fields,
+                            compiler.analyze(QueryCompiler.TITLE_FIELD, prefix.prefix()), fieldRanges));
         } else if (query instanceof ManualQuery.Phrase phrase) {
-            forEachField(phrase.field(), title, body,
-                    (field, tokens) -> markPhrase(tokens, field, compiler.analyze(field, phrase.text()), out));
+            return collectLeaf(phrase.field(), title, body, out,
+                    (fields, fieldRanges) -> markPaths(fields,
+                            compiler.expandedPhrasePaths(phrase.text(), dictionary), fieldRanges));
         }
+        throw new QueryException("unsupported query node: " + query);
+    }
+
+    private interface PathMatcher {
+        boolean matches(List<FieldTokens> fields, TreeSet<HitRange> out);
+    }
+
+    private record FieldTokens(String field, List<Token> tokens) {
+    }
+
+    private boolean collectLeaf(Field scope, String title, String body, TreeSet<HitRange> out, PathMatcher matcher) {
+        List<FieldTokens> fields = new ArrayList<>();
+        forEachField(scope, title, body, (field, tokens) -> fields.add(new FieldTokens(field, tokens)));
+        return matcher.matches(fields, out);
     }
 
     private interface FieldConsumer {
@@ -68,50 +106,48 @@ public final class HitRangeExtractor {
         }
     }
 
-    private void markTerm(List<Token> tokens, String field, List<String> terms, TreeSet<HitRange> out) {
-        if (terms.size() != 1) {
-            return;
-        }
-        String wanted = terms.get(0);
-        for (Token token : tokens) {
-            if (token.term().equals(wanted)) {
-                out.add(new HitRange(field, token.start(), token.end()));
-            }
-        }
-    }
-
-    private void markPrefix(List<Token> tokens, String field, List<String> prefixes, TreeSet<HitRange> out) {
+    private boolean markPrefix(List<FieldTokens> fields, List<String> prefixes, TreeSet<HitRange> out) {
         if (prefixes.size() != 1) {
-            return;
+            throw new QueryException("prefix query must analyze to exactly one token");
         }
         String prefix = prefixes.get(0);
-        for (Token token : tokens) {
-            if (token.term().startsWith(prefix)) {
-                out.add(new HitRange(field, token.start(), token.end()));
-            }
-        }
-    }
-
-    private void markPhrase(List<Token> tokens, String field, List<String> terms, TreeSet<HitRange> out) {
-        if (terms.isEmpty()) {
-            return;
-        }
-        for (int i = 0; i + terms.size() <= tokens.size(); i++) {
-            boolean match = true;
-            int position = tokens.get(i).position();
-            for (int j = 0; j < terms.size(); j++) {
-                Token token = tokens.get(i + j);
-                if (!token.term().equals(terms.get(j)) || token.position() != position + j) {
-                    match = false;
-                    break;
+        boolean matched = false;
+        for (FieldTokens fieldTokens : fields) {
+            for (Token token : fieldTokens.tokens()) {
+                if (token.term().startsWith(prefix)) {
+                    out.add(new HitRange(fieldTokens.field(), token.start(), token.end()));
+                    matched = true;
                 }
             }
-            if (match) {
-                Token first = tokens.get(i);
-                Token last = tokens.get(i + terms.size() - 1);
-                out.add(new HitRange(field, first.start(), last.end()));
+        }
+        return matched;
+    }
+
+    private boolean markPaths(List<FieldTokens> fields, List<List<String>> paths, TreeSet<HitRange> out) {
+        boolean matchedAny = false;
+        for (FieldTokens fieldTokens : fields) {
+            List<Token> tokens = fieldTokens.tokens();
+            for (List<String> terms : paths) {
+                for (int i = 0; i + terms.size() <= tokens.size(); i++) {
+                    boolean match = true;
+                    int position = tokens.get(i).position();
+                    for (int j = 0; j < terms.size(); j++) {
+                        Token token = tokens.get(i + j);
+                        if (!token.term().equals(terms.get(j)) || token.position() != position + j) {
+                            match = false;
+                            break;
+                        }
+                    }
+                    if (match) {
+                        matchedAny = true;
+                        Token first = tokens.get(i);
+                        Token last = tokens.get(i + terms.size() - 1);
+                        out.add(new HitRange(fieldTokens.field(), first.start(), last.end()));
+                    }
+                }
             }
         }
+        return matchedAny;
     }
 
     private List<Token> tokenize(String field, String text) {

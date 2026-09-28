@@ -1,5 +1,7 @@
 package com.example.manualsdk.query;
 
+import com.example.manualsdk.terminology.TerminologyDictionary;
+
 import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.analysis.TokenStream;
 import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
@@ -15,7 +17,9 @@ import org.apache.lucene.search.TermQuery;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Compiles a {@link ManualQuery} into a Lucene query. Title clauses carry a
@@ -35,23 +39,30 @@ public final class QueryCompiler {
     }
 
     public Query compile(ManualQuery query) {
+        return compile(query, TerminologyDictionary.empty());
+    }
+
+    public Query compile(ManualQuery query, TerminologyDictionary terminology) {
         if (query == null) {
             throw new QueryException("query must not be null");
         }
+        TerminologyDictionary dictionary = terminology == null ? TerminologyDictionary.empty() : terminology;
         if (query instanceof ManualQuery.Term term) {
-            return scoped(term.field(), field -> new TermQuery(new Term(field, normalize(term.text()))));
+            List<String> source = singleTerm(term.text());
+            return scoped(term.field(), field -> pathsQuery(field, expand(source, dictionary)));
         }
         if (query instanceof ManualQuery.Prefix prefix) {
             return scoped(prefix.field(), field -> new PrefixQuery(new Term(field, normalize(prefix.prefix()))));
         }
         if (query instanceof ManualQuery.Phrase phrase) {
-            return scoped(phrase.field(), field -> phraseQuery(field, phrase.text()));
+            List<String> source = phraseTerms(phrase.text());
+            return scoped(phrase.field(), field -> pathsQuery(field, expand(source, dictionary)));
         }
         if (query instanceof ManualQuery.And and) {
-            return combine(BooleanClause.Occur.MUST, and.children());
+            return combine(BooleanClause.Occur.MUST, and.children(), dictionary);
         }
         if (query instanceof ManualQuery.Or or) {
-            return combine(BooleanClause.Occur.SHOULD, or.children());
+            return combine(BooleanClause.Occur.SHOULD, or.children(), dictionary);
         }
         throw new QueryException("unsupported query node: " + query);
     }
@@ -71,23 +82,78 @@ public final class QueryCompiler {
         };
     }
 
-    private Query combine(BooleanClause.Occur occur, List<ManualQuery> children) {
+    private Query combine(BooleanClause.Occur occur, List<ManualQuery> children, TerminologyDictionary dictionary) {
         BooleanQuery.Builder builder = new BooleanQuery.Builder();
         for (ManualQuery child : children) {
-            builder.add(compile(child), occur);
+            builder.add(compile(child, dictionary), occur);
         }
         return builder.build();
     }
 
-    private Query phraseQuery(String luceneField, String text) {
-        List<String> terms = analyze(luceneField, text);
-        if (terms.isEmpty()) {
-            throw new QueryException("phrase analyzes to no terms: " + text);
+    private Query pathsQuery(String luceneField, List<List<String>> paths) {
+        Set<Query> queries = new LinkedHashSet<>();
+        for (List<String> path : paths) {
+            queries.add(leafQuery(luceneField, path));
         }
+        if (queries.size() == 1) {
+            return queries.iterator().next();
+        }
+        BooleanQuery.Builder builder = new BooleanQuery.Builder();
+        for (Query query : queries) {
+            builder.add(query, BooleanClause.Occur.SHOULD);
+        }
+        return builder.build();
+    }
+
+    private Query leafQuery(String luceneField, List<String> terms) {
         if (terms.size() == 1) {
             return new TermQuery(new Term(luceneField, terms.get(0)));
         }
         return new PhraseQuery(luceneField, terms.toArray(new String[0]));
+    }
+
+    private List<List<String>> expand(List<String> source, TerminologyDictionary dictionary) {
+        List<List<String>> paths = new ArrayList<>();
+        expand(source, dictionary, 0, new ArrayList<>(), paths);
+        return List.copyOf(paths);
+    }
+
+    private void expand(List<String> source, TerminologyDictionary dictionary, int index,
+                        List<String> current, List<List<String>> paths) {
+        if (index == source.size()) {
+            paths.add(List.copyOf(current));
+            return;
+        }
+        int matchLength = longestRule(source, dictionary, index);
+        if (matchLength == 0) {
+            current.add(source.get(index));
+            expand(source, dictionary, index + 1, current, paths);
+            current.remove(current.size() - 1);
+            return;
+        }
+
+        List<String> original = source.subList(index, index + matchLength);
+        addPath(source, dictionary, index, matchLength, current, paths, original);
+        for (List<String> alternative : dictionary.alternativesFor(original)) {
+            addPath(source, dictionary, index, matchLength, current, paths, alternative);
+        }
+    }
+
+    private void addPath(List<String> source, TerminologyDictionary dictionary, int index, int matchLength,
+                         List<String> current, List<List<String>> paths, List<String> replacement) {
+        int size = current.size();
+        current.addAll(replacement);
+        expand(source, dictionary, index + matchLength, current, paths);
+        current.subList(size, current.size()).clear();
+    }
+
+    private int longestRule(List<String> source, TerminologyDictionary dictionary, int index) {
+        for (int length = source.size() - index; length > 0; length--) {
+            if (!dictionary.alternativesFor(source.subList(index, index + length)).isEmpty()) {
+                return length;
+            }
+        }
+        return 0;
     }
 
     /** Analyzes text exactly as indexing does, returning the token stream. */
@@ -115,5 +181,32 @@ public final class QueryCompiler {
             throw new QueryException("term/prefix query must analyze to exactly one token: " + text);
         }
         return terms.get(0);
+    }
+
+    private List<String> singleTerm(String text) {
+        List<String> terms = analyze(TITLE_FIELD, text);
+        if (terms.isEmpty()) {
+            throw new QueryException("query text analyzes to no terms: " + text);
+        }
+        if (terms.size() != 1) {
+            throw new QueryException("term/prefix query must analyze to exactly one token: " + text);
+        }
+        return terms;
+    }
+
+    private List<String> phraseTerms(String text) {
+        List<String> terms = analyze(TITLE_FIELD, text);
+        if (terms.isEmpty()) {
+            throw new QueryException("phrase analyzes to no terms: " + text);
+        }
+        return terms;
+    }
+
+    public List<List<String>> expandedPhrasePaths(String text, TerminologyDictionary dictionary) {
+        return expand(phraseTerms(text), dictionary == null ? TerminologyDictionary.empty() : dictionary);
+    }
+
+    public List<List<String>> expandedTermPaths(String text, TerminologyDictionary dictionary) {
+        return expand(singleTerm(text), dictionary == null ? TerminologyDictionary.empty() : dictionary);
     }
 }

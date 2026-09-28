@@ -4,6 +4,7 @@ import com.example.manualsdk.index.ManualIndex;
 import com.example.manualsdk.model.HitRange;
 import com.example.manualsdk.model.SearchHit;
 import com.example.manualsdk.query.ManualQuery;
+import com.example.manualsdk.terminology.TerminologyDictionary;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
@@ -33,6 +34,8 @@ public final class SearchSession implements AutoCloseable {
     private final ManualQuery query;
     private final int pageSize;
     private final IndexSearcher searcher;
+    private final TerminologyDictionary terminology;
+    private org.apache.lucene.search.Query compiledQuery;
 
     private ScoreDoc after;
     private int pageNumber;
@@ -46,6 +49,7 @@ public final class SearchSession implements AutoCloseable {
         this.index = index;
         this.query = query;
         this.pageSize = pageSize;
+        this.terminology = index.terminology();
         this.searcher = index.searcherManager().acquire();
     }
 
@@ -56,7 +60,10 @@ public final class SearchSession implements AutoCloseable {
             return new SearchPage(List.of(), pageNumber, false);
         }
         try {
-            Query luceneQuery = index.queryCompiler().compile(query);
+            if (compiledQuery == null) {
+                compiledQuery = index.queryCompiler().compile(query, terminology);
+            }
+            Query luceneQuery = compiledQuery;
             TopFieldDocs top = searcher.searchAfter(after, luceneQuery, pageSize, SORT, true);
             List<SearchHit> hits = new ArrayList<>(top.scoreDocs.length);
             for (ScoreDoc scoreDoc : top.scoreDocs) {
@@ -77,7 +84,7 @@ public final class SearchSession implements AutoCloseable {
         String id = doc.get("id");
         String title = doc.get("title");
         String body = doc.get("body");
-        List<HitRange> ranges = index.hitExtractor().extract(query, title, body);
+        List<HitRange> ranges = index.hitExtractor().extract(query, terminology, title, body);
         return new SearchHit(id, scoreDoc.score, title, body, ranges);
     }
 
